@@ -4,47 +4,34 @@ import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import folium
-import leafmap.foliumap as leafmap
 from streamlit_folium import st_folium
 
 # -------------------------------
-# Page config MUST be first Streamlit call
+# Page config (must be first Streamlit call)
 # -------------------------------
 st.set_page_config(page_title="Egypt Governorates Atlas", layout="wide")
 
-
 # -------------------------------
-# Paths (single source of truth)
+# Paths
 # -------------------------------
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data" / "processed"
-TABLES = ROOT / "data" / "tables"
+DATA_PROCESSED = ROOT / "data" / "processed"
+DATA_TABLES = ROOT / "data" / "tables"
 
-
-def pick_geojson(data_dir: Path) -> Path:
-    geo_files = sorted(data_dir.glob("*.geojson"))
-    if not geo_files:
-        raise FileNotFoundError(f"No .geojson found in: {data_dir}")
-    return next((p for p in geo_files if "govern" in p.name.lower()), geo_files[0])
-
-
-GEO_PATH = pick_geojson(DATA)
-POP_PATH = DATA / "population.csv"
-IND_PATH = TABLES / "indicators.csv"
-
+GEO_PATH = DATA_PROCESSED / "governorates.geojson"
+POP_PATH = DATA_PROCESSED / "population.csv"
+IND_PATH = DATA_TABLES / "indicators.csv"
 
 # -------------------------------
-# Data status panel (safe)
+# Sidebar: Data status
 # -------------------------------
 with st.sidebar.expander("Data status", expanded=False):
-    st.write("Processed data folder:", str(DATA))
     st.write("GeoJSON:", GEO_PATH.name, "✅" if GEO_PATH.exists() else "❌")
     st.write("Population CSV:", POP_PATH.name, "✅" if POP_PATH.exists() else "❌")
     st.write("Indicators CSV:", IND_PATH.name, "✅" if IND_PATH.exists() else "❌")
 
-
 # -------------------------------
-# UI CSS tweaks (legend font size)
+# Small CSS (legend font)
 # -------------------------------
 st.markdown(
     """
@@ -56,254 +43,131 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# -------------------------------
+# Helpers: safe column dedupe (prevents GeoDataFrame duplicated columns error)
+# -------------------------------
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = pd.Series(df.columns)
+    for dup in cols[cols.duplicated()].unique():
+        dup_idx = cols[cols == dup].index.tolist()
+        for j, i in enumerate(dup_idx):
+            if j == 0:
+                continue
+            cols.iloc[i] = f"{dup}__dup{j}"
+    df.columns = cols.tolist()
+    return df
 
 # -------------------------------
-# Helpers
+# Loaders (no src/ imports)
 # -------------------------------
-def to_num(x):
-    """Safe scalar -> numeric (float) or NaN (avoids pd.to_numeric scalar TypeError)."""
-    return pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
-
-
-def compute_stats(df: pd.DataFrame, indicator: str) -> dict:
-    s = pd.to_numeric(df[indicator], errors="coerce")
-    s_non = s.dropna()
-    if len(s_non) == 0:
-        return {"mean": None, "min": None, "max": None, "ranks": None, "n": 0}
-    mean_val = float(s_non.mean())
-    min_val = float(s_non.min())
-    max_val = float(s_non.max())
-    ranks = s_non.rank(ascending=False, method="min")  # 1 = highest
-    return {"mean": mean_val, "min": min_val, "max": max_val, "ranks": ranks, "n": int(len(s_non))}
-
-
-def wow_sentence(lang: str, indicator_col: str, percentile: float) -> str:
-    if percentile is None:
-        return "—"
-    top10 = percentile >= 90
-    top25 = percentile >= 75
-    mid = 25 <= percentile < 75
-
-    if indicator_col == "compactness":
-        if lang == "English":
-            if top10:
-                return "Extremely compact shape (Top 10%)."
-            if top25:
-                return "More compact than most (Top 25%)."
-            if mid:
-                return "Moderately compact (Middle range)."
-            return "Among the least compact shapes (Bottom 25%)."
-        else:
-            if top10:
-                return "شكل شديد التماسك (ضمن أعلى 10%)."
-            if top25:
-                return "أكثر تماسكًا من معظم المحافظات (أعلى 25%)."
-            if mid:
-                return "تماسك متوسط (ضمن النطاق الأوسط)."
-            return "من أقل الأشكال تماسكًا (أدنى 25%)."
-
-    if lang == "English":
-        if top10:
-            return "Top 10% nationally."
-        if top25:
-            return "Top 25% nationally."
-        if mid:
-            return "Around the national middle range."
-        return "Bottom 25% nationally."
-    else:
-        if top10:
-            return "ضمن أعلى 10% على مستوى مصر."
-        if top25:
-            return "ضمن أعلى 25% على مستوى مصر."
-        if mid:
-            return "ضمن النطاق المتوسط على مستوى مصر."
-        return "ضمن أدنى 25% على مستوى مصر."
-
-
-def top_bottom_table(df: pd.DataFrame, indicator: str, n: int = 5):
-    t = df[["gov_id", "name_en", "name_ar", indicator]].copy()
-    t[indicator] = pd.to_numeric(t[indicator], errors="coerce")
-    t = t.dropna(subset=[indicator])
-    top = t.sort_values(indicator, ascending=False).head(n)
-    bottom = t.sort_values(indicator, ascending=True).head(n)
-    return top, bottom
-
-
-def format_value(indicator_col: str, x):
-    if pd.isna(x):
-        return "—"
-    if indicator_col == "compactness":
-        return f"{float(x):.3f}"
-    return f"{float(x):,.1f}"
-
-def dedupe_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    GeoPandas cannot contain duplicated column names.
-    Keep the first occurrence and drop the rest.
-    """
-    return gdf.loc[:, ~gdf.columns.duplicated()].copy()
-def load_geo(path: str) -> gpd.GeoDataFrame:
+def load_geo(path: Path) -> gpd.GeoDataFrame:
     gdf = gpd.read_file(path)
     if "gov_id" not in gdf.columns:
-        raise ValueError("GeoJSON must contain a 'gov_id' column.")
-    gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce")
+        raise ValueError("GeoJSON must include a 'gov_id' field.")
+    gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").astype("Int64")
     return gdf
 
-
-def load_population(path: str) -> pd.DataFrame:
+def load_population(path: Path) -> pd.DataFrame:
     pop = pd.read_csv(path)
     if "gov_id" not in pop.columns:
-        raise ValueError("population.csv must contain a 'gov_id' column.")
-    pop["gov_id"] = pd.to_numeric(pop["gov_id"], errors="coerce")
+        raise ValueError("population.csv must include a 'gov_id' column.")
+    pop["gov_id"] = pd.to_numeric(pop["gov_id"], errors="coerce").astype("Int64")
     return pop
 
-
 def merge_population(gdf: gpd.GeoDataFrame, pop: pd.DataFrame, year: int) -> gpd.GeoDataFrame:
-    # Try common patterns for year columns
-    candidates = [str(year), f"population_{year}", "population"]
+    # Try common column patterns
+    candidates = [str(year), f"population_{year}", "population_2023", "population"]
     year_col = next((c for c in candidates if c in pop.columns), None)
 
-    # If still none, try first non-gov_id column
     if year_col is None:
+        # last resort: first non-gov_id column
         other_cols = [c for c in pop.columns if c != "gov_id"]
         year_col = other_cols[0] if other_cols else None
 
     if year_col is None:
-        gdf["population"] = 0
+        gdf["population_2023"] = 0.0
         return gdf
 
     pop2 = pop[["gov_id", year_col]].copy()
-    pop2 = pop2.rename(columns={year_col: "population"})
-    pop2["population"] = pd.to_numeric(pop2["population"], errors="coerce").fillna(0)
+    pop2 = pop2.rename(columns={year_col: "population_2023"})
+    pop2["population_2023"] = pd.to_numeric(pop2["population_2023"], errors="coerce").fillna(0)
 
     out = gdf.merge(pop2, on="gov_id", how="left")
-    out["population"] = pd.to_numeric(out.get("population", 0), errors="coerce").fillna(0)
+    out["population_2023"] = pd.to_numeric(out["population_2023"], errors="coerce").fillna(0)
     return out
 
 # -------------------------------
-# Data loading (ONE function, always returns)
+# Load data (cached)
 # -------------------------------
 @st.cache_data(show_spinner=False)
-def load_data(geo_path: str, pop_path: str, ind_path: str, year: int):
-    # Base geo
-    gdf = load_geo(geo_path)
-    gdf = dedupe_columns(gdf)
+def load_data(geo_path: str, pop_path: str, ind_path: str, year: int) -> gpd.GeoDataFrame:
+    gdf = load_geo(Path(geo_path))
 
-    # Population (optional)
+    # Population
     if Path(pop_path).exists():
-        pop = load_population(pop_path)
+        pop = load_population(Path(pop_path))
         gdf = merge_population(gdf, pop, year=year)
-        gdf = dedupe_columns(gdf)
     else:
-        if "population" not in gdf.columns:
-            gdf["population"] = 0
+        gdf["population_2023"] = 0.0
 
-    # Rename population -> population_2023 safely
-    if "population" in gdf.columns:
-        if "population_2023" in gdf.columns and "population" != "population_2023":
-            # If both exist, prefer population_2023 and drop population
-            gdf = gdf.drop(columns=["population"])
-        else:
-            gdf = gdf.rename(columns={"population": "population_2023"})
-    else:
-        if "population_2023" not in gdf.columns:
-            gdf["population_2023"] = 0
-
-    gdf = dedupe_columns(gdf)
-
-    # Indicators table (optional)
+    # Indicators
     if Path(ind_path).exists():
         indicators = pd.read_csv(ind_path)
+        indicators = dedupe_columns(indicators)
 
-        # Ensure gov_id types align
-        gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").fillna(-1).astype(int)
-        indicators["gov_id"] = pd.to_numeric(indicators["gov_id"], errors="coerce").fillna(-1).astype(int)
+        # Normalize gov_id
+        indicators["gov_id"] = pd.to_numeric(indicators["gov_id"], errors="coerce").astype("Int64")
 
-        # Avoid duplicate indicator columns if repeated runs or overlaps
-        overlap = set(gdf.columns).intersection(set(indicators.columns)) - {"gov_id"}
-        if overlap:
-            indicators = indicators.drop(columns=list(overlap))
+        # Avoid duplicate column names after merge
+        gdf = dedupe_columns(gdf)
 
+        # Merge
         gdf = gdf.merge(indicators, on="gov_id", how="left")
         gdf = dedupe_columns(gdf)
 
     # Ensure CRS for web mapping
     try:
-        gdf = gdf.to_crs(epsg=4326)
+        if gdf.crs is not None and str(gdf.crs).lower() != "epsg:4326":
+            gdf = gdf.to_crs(epsg=4326)
+        elif gdf.crs is None:
+            # assume already lat/lon if undefined
+            pass
     except Exception:
         pass
 
+    # Ensure numeric type
+    gdf["population_2023"] = pd.to_numeric(gdf.get("population_2023", 0), errors="coerce").fillna(0)
+
     return gdf
 
-
-
-DEFAULT_YEAR = 2024
+DEFAULT_YEAR = 2023  # <-- IMPORTANT: match your indicator label
 gdf = load_data(str(GEO_PATH), str(POP_PATH), str(IND_PATH), DEFAULT_YEAR)
 
-def dedupe_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    GeoPandas cannot handle duplicated column names.
-    This keeps the first occurrence and drops the rest.
-    """
-    return gdf.loc[:, ~gdf.columns.duplicated()].copy()
-
 # -------------------------------
-# Guardrails: ensure required columns exist
+# Guardrails (only if missing)
 # -------------------------------
-for col in ["area_km2", "perimeter_km", "compactness", "centroid_lat", "centroid_lon"]:
+for col in ["area_km2", "perimeter_km", "compactness"]:
     if col not in gdf.columns:
         gdf[col] = 0.0
 
-if "population_2023" not in gdf.columns:
-    gdf["population_2023"] = 0
-
-# If your dataset doesn't contain these name fields, create fallbacks
+# Names fallback
 if "name_en" not in gdf.columns:
-    for c in ["gov_name", "NAME_EN", "ADM1_EN", "name"]:
-        if c in gdf.columns:
-            gdf["name_en"] = gdf[c].astype(str)
-            break
-    else:
-        gdf["name_en"] = gdf["gov_id"].astype(str)
-
+    gdf["name_en"] = gdf["gov_id"].astype(str)
 if "name_ar" not in gdf.columns:
-    for c in ["NAME_AR", "ADM1_AR", "name_ar"]:
-        if c in gdf.columns:
-            gdf["name_ar"] = gdf[c].astype(str)
-            break
-    else:
-        gdf["name_ar"] = gdf["name_en"].astype(str)
-
-# Detect if population is effectively empty (SUPER SAFE)
-if "population_2023" in gdf.columns:
-    pop_col = gdf["population_2023"]
-
-    # If duplicate columns exist, gdf["population_2023"] can become a DataFrame.
-    # This forces a single Series:
-    if isinstance(pop_col, pd.DataFrame):
-        pop_col = pop_col.iloc[:, 0]
-
-    pop_series = pd.to_numeric(pd.Series(pop_col), errors="coerce").fillna(0)
-else:
-    pop_series = pd.Series(0, index=gdf.index, dtype="float64")
-
-population_is_empty = (pop_series <= 0).all()
-
-
+    gdf["name_ar"] = gdf["name_en"].astype(str)
 
 # -------------------------------
-# Metric descriptions (EN/AR)
+# Metric help
 # -------------------------------
 metric_help = {
     "population_2023": {
-        "en": "Estimated residents (demo). Replace with official data when available.",
-        "ar": "تقدير عدد السكان (عرض تجريبي). استبدله بالبيانات الرسمية لاحقًا.",
+        "en": "Residents (from population.csv).",
+        "ar": "عدد السكان (من ملف population.csv).",
     },
     "area_km2": {"en": "Governorate land area in km².", "ar": "مساحة المحافظة كم²."},
     "perimeter_km": {"en": "Boundary length in km.", "ar": "طول الحدود كم."},
     "compactness": {"en": "Shape compactness (0–1).", "ar": "تماسك الشكل (0–1)."},
 }
-
 
 # -------------------------------
 # Sidebar
@@ -311,64 +175,41 @@ metric_help = {
 lang = st.sidebar.radio("Language / اللغة", options=["English", "العربية"], index=0)
 display_col = "name_en" if lang == "English" else "name_ar"
 
-if lang == "English":
-    indicator_options = {
-        "Population (2023)": "population_2023",
-        "Area (km²)": "area_km2",
-        "Perimeter (km)": "perimeter_km",
-        "Compactness Index": "compactness",
-    }
-else:
-    indicator_options = {
-        "عدد السكان (2023)": "population_2023",
-        "المساحة (كم²)": "area_km2",
-        "المحيط (كم)": "perimeter_km",
-        "مؤشر التماسك": "compactness",
-    }
-
-indicator_label = st.sidebar.selectbox(
-    "Indicator" if lang == "English" else "المؤشر",
-    options=list(indicator_options.keys()),
+indicator_options = (
+    {"Population (2023)": "population_2023", "Area (km²)": "area_km2", "Perimeter (km)": "perimeter_km", "Compactness Index": "compactness"}
+    if lang == "English"
+    else {"عدد السكان (2023)": "population_2023", "المساحة (كم²)": "area_km2", "المحيط (كم)": "perimeter_km", "مؤشر التماسك": "compactness"}
 )
+
+indicator_label = st.sidebar.selectbox("Indicator" if lang == "English" else "المؤشر", list(indicator_options.keys()))
 indicator_col = indicator_options[indicator_label]
-if indicator_col not in gdf.columns:
-    indicator_col = "population_2023"
 
 desc = metric_help.get(indicator_col, {})
 st.sidebar.caption(desc.get("en", "") if lang == "English" else desc.get("ar", ""))
 
-# Ensure gov_id is int everywhere (important!)
-gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").fillna(-1).astype(int)
+# Governorate A / B
+gov_options = gdf[[ "gov_id", "name_en", "name_ar" ]].dropna(subset=["gov_id"]).copy()
+gov_options["gov_id"] = gov_options["gov_id"].astype(int)
 
-# Session defaults
-if "selected_gov_id" not in st.session_state:
-    st.session_state["selected_gov_id"] = int(gdf["gov_id"].dropna().iloc[0])
-
-gov_options = gdf.sort_values(display_col)[["gov_id", display_col]].copy()
-gov_options["gov_id"] = pd.to_numeric(gov_options["gov_id"], errors="coerce").fillna(-1).astype(int)
 gov_id_list = gov_options["gov_id"].tolist()
 
-# Select A
-a_choice = st.sidebar.selectbox(
+a_id = st.sidebar.selectbox(
     "Governorate (A)" if lang == "English" else "المحافظة (A)",
     options=gov_id_list,
     format_func=lambda gid: gov_options.loc[gov_options["gov_id"] == gid, display_col].iloc[0],
-    index=gov_id_list.index(st.session_state["selected_gov_id"])
-    if st.session_state["selected_gov_id"] in gov_id_list
-    else 0,
+    index=0,
 )
-st.session_state["selected_gov_id"] = int(a_choice)
 
-# Select B
-b_default = next((gid for gid in gov_id_list if gid != st.session_state["selected_gov_id"]), gov_id_list[0])
-b_choice = st.sidebar.selectbox(
+# B defaults to a different one
+b_candidates = [x for x in gov_id_list if x != a_id]
+b_default = b_candidates[0] if b_candidates else a_id
+
+b_id = st.sidebar.selectbox(
     "Compare with (B)" if lang == "English" else "قارن مع (B)",
     options=gov_id_list,
     format_func=lambda gid: gov_options.loc[gov_options["gov_id"] == gid, display_col].iloc[0],
     index=gov_id_list.index(b_default),
 )
-compare_id = int(b_choice)
-
 
 # -------------------------------
 # Layout
@@ -378,19 +219,18 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Click a governorate" if lang == "English" else "اضغط على محافظة")
 
-    m = leafmap.Map(center=[26.8, 30.8], zoom=6)
+    # IMPORTANT: use folium.Map directly (most stable on Streamlit Cloud)
+    m = folium.Map(location=[26.8, 30.8], zoom_start=6, tiles="cartodbpositron")
+
     gjson = gdf.to_json()
 
     def style_fn(_feature):
-        return {"weight": 1, "color": "black", "fillOpacity": 0.4}
+        return {"weight": 1, "color": "black", "fillOpacity": 0.2}
 
     def highlight_fn(_feature):
-        return {"weight": 2, "color": "black", "fillOpacity": 0.7}
+        return {"weight": 2, "color": "black", "fillOpacity": 0.6}
 
-    tooltip_fields = ["gov_id", "name_en", "name_ar", indicator_col]
-    tooltip_aliases = ["ID", "English", "Arabic", indicator_label]
-    tooltip = folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, sticky=True)
-
+    # Choropleth
     folium.Choropleth(
         geo_data=gjson,
         data=gdf,
@@ -403,6 +243,13 @@ with col1:
         legend_name=indicator_label,
     ).add_to(m)
 
+    # Tooltip overlay
+    tooltip = folium.GeoJsonTooltip(
+        fields=["gov_id", "name_en", "name_ar", indicator_col],
+        aliases=["ID", "English", "Arabic", indicator_label],
+        sticky=True,
+    )
+
     folium.GeoJson(
         data=gjson,
         name="Governorates",
@@ -411,142 +258,47 @@ with col1:
         tooltip=tooltip,
     ).add_to(m)
 
-    # Highlight selected A
-    sel = gdf[gdf["gov_id"] == st.session_state["selected_gov_id"]]
-    if len(sel) > 0:
-        folium.GeoJson(
-            data=sel.to_json(),
-            name="Selected A",
-            style_function=lambda _f: {"weight": 3, "color": "black", "fillOpacity": 0.05},
-        ).add_to(m)
-
-    out = st_folium(m, height=600, width=None)
-
-    # Click capture
-    clicked = None
-    if out and out.get("last_active_drawing") and out["last_active_drawing"].get("properties"):
-        clicked = out["last_active_drawing"]["properties"].get("gov_id")
-
-    if clicked is not None:
-        st.session_state["selected_gov_id"] = int(clicked)
-
+    # Render
+    st_folium(m, height=650, width=None)
 
 with col2:
-    sel_rows = gdf[gdf["gov_id"] == st.session_state["selected_gov_id"]]
-    selected_row = sel_rows.iloc[0] if len(sel_rows) > 0 else gdf.iloc[0]
+    row_a = gdf[gdf["gov_id"].astype(int) == int(a_id)].iloc[0]
+    name_a = row_a["name_en"] if lang == "English" else row_a["name_ar"]
 
     st.subheader("Governorate Profile" if lang == "English" else "ملف المحافظة")
-    st.markdown(f"### {selected_row['name_en']}")
-    st.markdown(f"**{selected_row['name_ar']}**")
-
-    stats = compute_stats(gdf, indicator_col)
-    val_num = to_num(selected_row.get(indicator_col))  # ✅ FIXED
+    st.markdown(f"### {row_a['name_en']}")
+    st.markdown(f"**{row_a['name_ar']}**")
 
     st.divider()
-    st.subheader("Quick Insights" if lang == "English" else "ملخص سريع")
+    st.markdown(f"**{indicator_label}**")
 
-    if stats["n"] > 0 and pd.notna(val_num) and stats["ranks"] is not None:
-        rank = int(stats["ranks"].loc[selected_row.name])
-        n = stats["n"]
-        percentile = 100.0 * (n - rank) / (n - 1) if n > 1 else 100.0
-        wow = wow_sentence(lang, indicator_col, percentile)
-
-        if lang == "English":
-            st.write(f"**Rank:** {rank} / {n}")
-            st.write(f"**Percentile:** {percentile:.0f}th")
-            st.write(f"**National average:** {stats['mean']:.1f}")
-            st.write(f"**National min–max:** {stats['min']:.1f} – {stats['max']:.1f}")
-        else:
-            st.write(f"**الترتيب:** {rank} / {n}")
-            st.write(f"**المئين:** {percentile:.0f}")
-            st.write(f"**المتوسط الوطني:** {stats['mean']:.1f}")
-            st.write(f"**الحد الأدنى–الأقصى:** {stats['min']:.1f} – {stats['max']:.1f}")
-
-        st.info(wow)
+    val = pd.to_numeric(row_a.get(indicator_col), errors="coerce")
+    if pd.isna(val):
+        st.write("—")
     else:
-        st.info("No data for this indicator yet." if lang == "English" else "لا توجد بيانات لهذا المؤشر بعد.")
+        if indicator_col == "compactness":
+            st.write(f"{float(val):.3f}")
+        else:
+            st.write(f"{float(val):,.1f}")
 
-    # Compare A vs B
     st.divider()
     st.subheader("Compare A vs B" if lang == "English" else "مقارنة A و B")
 
-    row_a_df = gdf[gdf["gov_id"] == st.session_state["selected_gov_id"]]
-    row_b_df = gdf[gdf["gov_id"] == compare_id]
+    row_b = gdf[gdf["gov_id"].astype(int) == int(b_id)].iloc[0]
+    name_b = row_b["name_en"] if lang == "English" else row_b["name_ar"]
 
-    if len(row_a_df) == 0 or len(row_b_df) == 0:
-        st.warning("Could not find one of the selected governorates.")
-    else:
-        row_a = row_a_df.iloc[0]
-        row_b = row_b_df.iloc[0]
+    val_a = pd.to_numeric(row_a.get(indicator_col), errors="coerce")
+    val_b = pd.to_numeric(row_b.get(indicator_col), errors="coerce")
 
-        name_a = row_a["name_en"] if lang == "English" else row_a["name_ar"]
-        name_b = row_b["name_en"] if lang == "English" else row_b["name_ar"]
+    def fmt(x):
+        if pd.isna(x):
+            return "—"
+        if indicator_col == "compactness":
+            return f"{float(x):.3f}"
+        return f"{float(x):,.1f}"
 
-        val_a = to_num(row_a.get(indicator_col))  # ✅ FIXED
-        val_b = to_num(row_b.get(indicator_col))  # ✅ FIXED
+    delta = (val_b - val_a) if (pd.notna(val_a) and pd.notna(val_b)) else None
 
-        def fmt_val(x):
-            if pd.isna(x):
-                return "—"
-            if indicator_col == "compactness":
-                return f"{float(x):.3f}"
-            return f"{float(x):,.1f}"
-
-        delta = float(val_b - val_a) if (pd.notna(val_a) and pd.notna(val_b)) else None
-        pct = (100.0 * delta / float(val_a)) if (delta is not None and pd.notna(val_a) and float(val_a) != 0) else None
-
-        def fmt_delta(d):
-            if d is None:
-                return "—"
-            sign = "+" if d > 0 else ""
-            return f"{sign}{d:.3f}" if indicator_col == "compactness" else f"{sign}{d:,.1f}"
-
-        def fmt_pct(p):
-            if p is None:
-                return "—"
-            sign = "+" if p > 0 else ""
-            return f"{sign}{p:.1f}%"
-
-        comp_tbl = pd.DataFrame(
-            {
-                "Item" if lang == "English" else "البند": [
-                    "Governorate" if lang == "English" else "المحافظة",
-                    indicator_label,
-                    "Δ (B − A)" if lang == "English" else "الفرق (B − A)",
-                    "%Δ vs A" if lang == "English" else "نسبة التغير مقابل A",
-                ],
-                "A": [name_a, fmt_val(val_a), "—", "—"],
-                "B": [name_b, fmt_val(val_b), fmt_delta(delta), fmt_pct(pct)],
-            }
-        )
-        st.dataframe(comp_tbl, use_container_width=True)
-
-    # League table
-    st.divider()
-    st.subheader("League Table" if lang == "English" else "جدول الترتيب")
-
-    top_df, bottom_df = top_bottom_table(gdf, indicator_col, n=5)
-
-    if len(top_df) == 0:
-        st.info("Not enough data to build a table." if lang == "English" else "لا توجد بيانات كافية لعرض الجدول.")
-    else:
-        if lang == "English":
-            top_show = top_df[["name_en", indicator_col]].copy()
-            top_show.columns = ["Top 5", indicator_label]
-            top_show[indicator_label] = top_show[indicator_label].map(lambda x: format_value(indicator_col, x))
-
-            bottom_show = bottom_df[["name_en", indicator_col]].copy()
-            bottom_show.columns = ["Bottom 5", indicator_label]
-            bottom_show[indicator_label] = bottom_show[indicator_label].map(lambda x: format_value(indicator_col, x))
-        else:
-            top_show = top_df[["name_ar", indicator_col]].copy()
-            top_show.columns = ["أعلى 5", indicator_label]
-            top_show[indicator_label] = top_show[indicator_label].map(lambda x: format_value(indicator_col, x))
-
-            bottom_show = bottom_df[["name_ar", indicator_col]].copy()
-            bottom_show.columns = ["أدنى 5", indicator_label]
-            bottom_show[indicator_label] = bottom_show[indicator_label].map(lambda x: format_value(indicator_col, x))
-
-        st.write(top_show, use_container_width=True)
-        st.write(bottom_show, use_container_width=True)
-
+    st.write(f"**A:** {name_a} → {fmt(val_a)}")
+    st.write(f"**B:** {name_b} → {fmt(val_b)}")
+    st.write(f"**Δ (B − A):** {fmt(delta) if delta is not None else '—'}")
