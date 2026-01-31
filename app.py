@@ -7,9 +7,6 @@ import folium
 import leafmap.foliumap as leafmap
 from streamlit_folium import st_folium
 
-from src.io import load_geo, load_population, merge_population
-
-
 # -------------------------------
 # Page config MUST be first Streamlit call
 # -------------------------------
@@ -145,6 +142,43 @@ def dedupe_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Keep the first occurrence and drop the rest.
     """
     return gdf.loc[:, ~gdf.columns.duplicated()].copy()
+def load_geo(path: str) -> gpd.GeoDataFrame:
+    gdf = gpd.read_file(path)
+    if "gov_id" not in gdf.columns:
+        raise ValueError("GeoJSON must contain a 'gov_id' column.")
+    gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce")
+    return gdf
+
+
+def load_population(path: str) -> pd.DataFrame:
+    pop = pd.read_csv(path)
+    if "gov_id" not in pop.columns:
+        raise ValueError("population.csv must contain a 'gov_id' column.")
+    pop["gov_id"] = pd.to_numeric(pop["gov_id"], errors="coerce")
+    return pop
+
+
+def merge_population(gdf: gpd.GeoDataFrame, pop: pd.DataFrame, year: int) -> gpd.GeoDataFrame:
+    # Try common patterns for year columns
+    candidates = [str(year), f"population_{year}", "population"]
+    year_col = next((c for c in candidates if c in pop.columns), None)
+
+    # If still none, try first non-gov_id column
+    if year_col is None:
+        other_cols = [c for c in pop.columns if c != "gov_id"]
+        year_col = other_cols[0] if other_cols else None
+
+    if year_col is None:
+        gdf["population"] = 0
+        return gdf
+
+    pop2 = pop[["gov_id", year_col]].copy()
+    pop2 = pop2.rename(columns={year_col: "population"})
+    pop2["population"] = pd.to_numeric(pop2["population"], errors="coerce").fillna(0)
+
+    out = gdf.merge(pop2, on="gov_id", how="left")
+    out["population"] = pd.to_numeric(out.get("population", 0), errors="coerce").fillna(0)
+    return out
 
 # -------------------------------
 # Data loading (ONE function, always returns)
@@ -515,3 +549,4 @@ with col2:
 
         st.write(top_show, use_container_width=True)
         st.write(bottom_show, use_container_width=True)
+
