@@ -200,15 +200,21 @@ a_id = st.sidebar.selectbox(
     index=0,
 )
 
-# B defaults to a different one
-b_candidates = [x for x in gov_id_list if x != a_id]
-b_default = b_candidates[0] if b_candidates else a_id
+# B defaults to a different one (safe)
+b_candidates = [int(x) for x in gov_id_list if int(x) != int(a_id)]
+b_default = b_candidates[0] if b_candidates else int(a_id)
+
+# Safe index (avoid ValueError if not found)
+try:
+    b_index = [int(x) for x in gov_id_list].index(int(b_default))
+except ValueError:
+    b_index = 0
 
 b_id = st.sidebar.selectbox(
     "Compare with (B)" if lang == "English" else "قارن مع (B)",
     options=gov_id_list,
-    format_func=lambda gid: gov_options.loc[gov_options["gov_id"] == gid, display_col].iloc[0],
-    index=gov_id_list.index(b_default),
+    format_func=lambda gid: gov_options.loc[gov_options["gov_id"] == int(gid), display_col].iloc[0],
+    index=b_index,
 )
 
 # -------------------------------
@@ -302,3 +308,4 @@ with col2:
     st.write(f"**A:** {name_a} → {fmt(val_a)}")
     st.write(f"**B:** {name_b} → {fmt(val_b)}")
     st.write(f"**Δ (B − A):** {fmt(delta) if delta is not None else '—'}")
+
