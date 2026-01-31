@@ -82,11 +82,32 @@ def load_geo(path: Path) -> gpd.GeoDataFrame:
     gdf = gpd.read_file(path)
     gdf = dedupe_columns(gdf)
 
-    if "gov_id" not in gdf.columns:
-        raise ValueError("GeoJSON must include a 'gov_id' field.")
+    # --- AUTO-DETECT ID FIELD ---
+    id_candidates = [
+        "gov_id",
+        "ID_1", "ID",
+        "ADM1_CODE", "ADM1_PCODE",
+        "GID_1",
+    ]
 
-    gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").astype("Int64")
+    found_id = next((c for c in id_candidates if c in gdf.columns), None)
+
+    if found_id is None:
+        raise ValueError(
+            f"No suitable ID field found. Available columns: {list(gdf.columns)}"
+        )
+
+    # Create canonical gov_id
+    gdf["gov_id"] = pd.to_numeric(gdf[found_id], errors="coerce")
+
+    # If still empty, create a stable ID
+    if gdf["gov_id"].isna().all():
+        gdf["gov_id"] = range(1, len(gdf) + 1)
+
+    gdf["gov_id"] = gdf["gov_id"].astype("Int64")
+
     return gdf
+
 
 
 def load_population(path: Path) -> pd.DataFrame:
@@ -390,3 +411,4 @@ with col2:
         st.write(f"**A:** {name_a} → {fmt(val_a)}")
         st.write(f"**B:** {name_b} → {fmt(val_b)}")
         st.write(f"**Δ (B − A):** {fmt(delta) if delta is not None else '—'}")
+
