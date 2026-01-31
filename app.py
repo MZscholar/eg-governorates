@@ -44,7 +44,7 @@ st.markdown(
 )
 
 # -------------------------------
-# Helpers: safe column dedupe (prevents GeoDataFrame duplicated columns error)
+# Helpers: safe column dedupe (prevents duplicated columns error)
 # -------------------------------
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = pd.Series(df.columns)
@@ -54,25 +54,51 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
             if j == 0:
                 continue
             cols.iloc[i] = f"{dup}__dup{j}"
+    df = df.copy()
     df.columns = cols.tolist()
     return df
+
+
+def safe_int_series(x) -> pd.Series:
+    """
+    Convert input to a 1D numeric series safely (handles duplicate columns, DataFrame selection, scalars).
+    """
+    if isinstance(x, pd.DataFrame):
+        # If duplicate columns exist, gdf["col"] can return a DataFrame.
+        # Pick the first column deterministically.
+        if x.shape[1] == 0:
+            return pd.Series(dtype="float64")
+        x = x.iloc[:, 0]
+    if isinstance(x, pd.Series):
+        return pd.to_numeric(x, errors="coerce")
+    # scalar fallback
+    return pd.to_numeric(pd.Series([x]), errors="coerce")
+
 
 # -------------------------------
 # Loaders (no src/ imports)
 # -------------------------------
 def load_geo(path: Path) -> gpd.GeoDataFrame:
     gdf = gpd.read_file(path)
+    gdf = dedupe_columns(gdf)
+
     if "gov_id" not in gdf.columns:
         raise ValueError("GeoJSON must include a 'gov_id' field.")
+
     gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").astype("Int64")
     return gdf
 
+
 def load_population(path: Path) -> pd.DataFrame:
     pop = pd.read_csv(path)
+    pop = dedupe_columns(pop)
+
     if "gov_id" not in pop.columns:
         raise ValueError("population.csv must include a 'gov_id' column.")
+
     pop["gov_id"] = pd.to_numeric(pop["gov_id"], errors="coerce").astype("Int64")
     return pop
+
 
 def merge_population(gdf: gpd.GeoDataFrame, pop: pd.DataFrame, year: int) -> gpd.GeoDataFrame:
     # Try common column patterns
@@ -84,17 +110,21 @@ def merge_population(gdf: gpd.GeoDataFrame, pop: pd.DataFrame, year: int) -> gpd
         other_cols = [c for c in pop.columns if c != "gov_id"]
         year_col = other_cols[0] if other_cols else None
 
+    out = gdf.copy()
     if year_col is None:
-        gdf["population_2023"] = 0.0
-        return gdf
+        out["population_2023"] = 0.0
+        return out
 
     pop2 = pop[["gov_id", year_col]].copy()
     pop2 = pop2.rename(columns={year_col: "population_2023"})
     pop2["population_2023"] = pd.to_numeric(pop2["population_2023"], errors="coerce").fillna(0)
 
-    out = gdf.merge(pop2, on="gov_id", how="left")
-    out["population_2023"] = pd.to_numeric(out["population_2023"], errors="coerce").fillna(0)
+    out = out.merge(pop2, on="gov_id", how="left")
+    out = dedupe_columns(out)
+
+    out["population_2023"] = safe_int_series(out.get("population_2023", 0)).fillna(0)
     return out
+
 
 # -------------------------------
 # Load data (cached)
@@ -115,13 +145,12 @@ def load_data(geo_path: str, pop_path: str, ind_path: str, year: int) -> gpd.Geo
         indicators = pd.read_csv(ind_path)
         indicators = dedupe_columns(indicators)
 
-        # Normalize gov_id
+        if "gov_id" not in indicators.columns:
+            raise ValueError("indicators.csv must include a 'gov_id' column.")
+
         indicators["gov_id"] = pd.to_numeric(indicators["gov_id"], errors="coerce").astype("Int64")
 
-        # Avoid duplicate column names after merge
         gdf = dedupe_columns(gdf)
-
-        # Merge
         gdf = gdf.merge(indicators, on="gov_id", how="left")
         gdf = dedupe_columns(gdf)
 
@@ -129,18 +158,17 @@ def load_data(geo_path: str, pop_path: str, ind_path: str, year: int) -> gpd.Geo
     try:
         if gdf.crs is not None and str(gdf.crs).lower() != "epsg:4326":
             gdf = gdf.to_crs(epsg=4326)
-        elif gdf.crs is None:
-            # assume already lat/lon if undefined
-            pass
     except Exception:
+        # keep app running
         pass
 
-    # Ensure numeric type
-    gdf["population_2023"] = pd.to_numeric(gdf.get("population_2023", 0), errors="coerce").fillna(0)
+    # Ensure numeric
+    gdf["population_2023"] = safe_int_series(gdf.get("population_2023", 0)).fillna(0)
 
     return gdf
 
-DEFAULT_YEAR = 2023  # <-- IMPORTANT: match your indicator label
+
+DEFAULT_YEAR = 2023  # should match your UI label
 gdf = load_data(str(GEO_PATH), str(POP_PATH), str(IND_PATH), DEFAULT_YEAR)
 
 # -------------------------------
@@ -156,14 +184,14 @@ if "name_en" not in gdf.columns:
 if "name_ar" not in gdf.columns:
     gdf["name_ar"] = gdf["name_en"].astype(str)
 
+# Ensure gov_id is usable
+gdf["gov_id"] = pd.to_numeric(gdf["gov_id"], errors="coerce").astype("Int64")
+
 # -------------------------------
 # Metric help
 # -------------------------------
 metric_help = {
-    "population_2023": {
-        "en": "Residents (from population.csv).",
-        "ar": "عدد السكان (من ملف population.csv).",
-    },
+    "population_2023": {"en": "Residents (from population.csv).", "ar": "عدد السكان (من ملف population.csv)."},
     "area_km2": {"en": "Governorate land area in km².", "ar": "مساحة المحافظة كم²."},
     "perimeter_km": {"en": "Boundary length in km.", "ar": "طول الحدود كم."},
     "compactness": {"en": "Shape compactness (0–1).", "ar": "تماسك الشكل (0–1)."},
@@ -176,44 +204,80 @@ lang = st.sidebar.radio("Language / اللغة", options=["English", "العرب
 display_col = "name_en" if lang == "English" else "name_ar"
 
 indicator_options = (
-    {"Population (2023)": "population_2023", "Area (km²)": "area_km2", "Perimeter (km)": "perimeter_km", "Compactness Index": "compactness"}
+    {
+        "Population (2023)": "population_2023",
+        "Area (km²)": "area_km2",
+        "Perimeter (km)": "perimeter_km",
+        "Compactness Index": "compactness",
+    }
     if lang == "English"
-    else {"عدد السكان (2023)": "population_2023", "المساحة (كم²)": "area_km2", "المحيط (كم)": "perimeter_km", "مؤشر التماسك": "compactness"}
+    else {
+        "عدد السكان (2023)": "population_2023",
+        "المساحة (كم²)": "area_km2",
+        "المحيط (كم)": "perimeter_km",
+        "مؤشر التماسك": "compactness",
+    }
 )
 
-indicator_label = st.sidebar.selectbox("Indicator" if lang == "English" else "المؤشر", list(indicator_options.keys()))
+indicator_label = st.sidebar.selectbox(
+    "Indicator" if lang == "English" else "المؤشر",
+    options=list(indicator_options.keys()),
+)
 indicator_col = indicator_options[indicator_label]
+
+# Safety: if missing indicator, fallback to population_2023
+if indicator_col not in gdf.columns:
+    indicator_col = "population_2023"
 
 desc = metric_help.get(indicator_col, {})
 st.sidebar.caption(desc.get("en", "") if lang == "English" else desc.get("ar", ""))
 
-# Governorate A / B
-gov_options = gdf[[ "gov_id", "name_en", "name_ar" ]].dropna(subset=["gov_id"]).copy()
-gov_options["gov_id"] = gov_options["gov_id"].astype(int)
+# Governorate options
+gov_options = gdf[["gov_id", "name_en", "name_ar"]].dropna(subset=["gov_id"]).copy()
+gov_options = dedupe_columns(gov_options)
+gov_options["gov_id"] = pd.to_numeric(gov_options["gov_id"], errors="coerce").fillna(-1).astype(int)
+gov_options = gov_options[gov_options["gov_id"] >= 0].drop_duplicates(subset=["gov_id"]).sort_values(display_col)
 
 gov_id_list = gov_options["gov_id"].tolist()
+
+if len(gov_id_list) == 0:
+    st.error("No valid 'gov_id' values found. Check your GeoJSON 'gov_id' field.")
+    st.stop()
+
+
+def format_gov(gid: int) -> str:
+    s = gov_options.loc[gov_options["gov_id"] == int(gid), display_col]
+    return s.iloc[0] if not s.empty else f"ID {gid}"
+
+
+# -------------------------------
+# A and B selection (ORDER MATTERS)
+# -------------------------------
+if "a_id" not in st.session_state:
+    st.session_state["a_id"] = int(gov_id_list[0])
 
 a_id = st.sidebar.selectbox(
     "Governorate (A)" if lang == "English" else "المحافظة (A)",
     options=gov_id_list,
-    format_func=lambda gid: gov_options.loc[gov_options["gov_id"] == gid, display_col].iloc[0],
-    index=0,
+    key="a_id",
+    format_func=format_gov,
 )
 
-# -------------------------------
-# Compare governorate B (SAFE)
-# -------------------------------
+# Ensure B always differs from A where possible
 if "b_id" not in st.session_state:
     b_candidates = [int(x) for x in gov_id_list if int(x) != int(a_id)]
     st.session_state["b_id"] = b_candidates[0] if b_candidates else int(a_id)
+else:
+    # If user changes A and B becomes invalid, auto-fix B
+    if int(st.session_state["b_id"]) == int(a_id):
+        b_candidates = [int(x) for x in gov_id_list if int(x) != int(a_id)]
+        st.session_state["b_id"] = b_candidates[0] if b_candidates else int(a_id)
 
 b_id = st.sidebar.selectbox(
     "Compare with (B)" if lang == "English" else "قارن مع (B)",
     options=gov_id_list,
     key="b_id",
-    format_func=lambda gid: gov_options.loc[
-        gov_options["gov_id"] == int(gid), display_col
-    ].iloc[0],
+    format_func=format_gov,
 )
 
 # -------------------------------
@@ -224,10 +288,14 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Click a governorate" if lang == "English" else "اضغط على محافظة")
 
-    # IMPORTANT: use folium.Map directly (most stable on Streamlit Cloud)
+    # Use folium.Map directly (most stable on Streamlit Cloud)
     m = folium.Map(location=[26.8, 30.8], zoom_start=6, tiles="cartodbpositron")
 
-    gjson = gdf.to_json()
+    # Make sure gov_id in GeoJSON is numeric (folium joins on properties.gov_id)
+    gdf_for_map = gdf.copy()
+    gdf_for_map["gov_id"] = pd.to_numeric(gdf_for_map["gov_id"], errors="coerce").fillna(-1).astype(int)
+
+    gjson = gdf_for_map.to_json()
 
     def style_fn(_feature):
         return {"weight": 1, "color": "black", "fillOpacity": 0.2}
@@ -238,7 +306,7 @@ with col1:
     # Choropleth
     folium.Choropleth(
         geo_data=gjson,
-        data=gdf,
+        data=gdf_for_map,
         columns=["gov_id", indicator_col],
         key_on="feature.properties.gov_id",
         fill_color="YlOrRd",
@@ -249,9 +317,15 @@ with col1:
     ).add_to(m)
 
     # Tooltip overlay
+    tooltip_fields = ["gov_id", "name_en", "name_ar"]
+    tooltip_aliases = ["ID", "English", "Arabic"]
+    if indicator_col in gdf_for_map.columns:
+        tooltip_fields.append(indicator_col)
+        tooltip_aliases.append(indicator_label)
+
     tooltip = folium.GeoJsonTooltip(
-        fields=["gov_id", "name_en", "name_ar", indicator_col],
-        aliases=["ID", "English", "Arabic", indicator_label],
+        fields=tooltip_fields,
+        aliases=tooltip_aliases,
         sticky=True,
     )
 
@@ -263,11 +337,22 @@ with col1:
         tooltip=tooltip,
     ).add_to(m)
 
-    # Render
+    # Render (keep returned object if you later want click capture)
     st_folium(m, height=650, width=None)
 
 with col2:
-    row_a = gdf[gdf["gov_id"].astype(int) == int(a_id)].iloc[0]
+    # Robust row access
+    gdf_idx = gdf.copy()
+    gdf_idx["gov_id_int"] = pd.to_numeric(gdf_idx["gov_id"], errors="coerce").fillna(-1).astype(int)
+
+    row_a_df = gdf_idx[gdf_idx["gov_id_int"] == int(a_id)]
+    row_b_df = gdf_idx[gdf_idx["gov_id_int"] == int(b_id)]
+
+    if row_a_df.empty:
+        st.error("Could not find Governorate (A) in the data.")
+        st.stop()
+
+    row_a = row_a_df.iloc[0]
     name_a = row_a["name_en"] if lang == "English" else row_a["name_ar"]
 
     st.subheader("Governorate Profile" if lang == "English" else "ملف المحافظة")
@@ -281,31 +366,27 @@ with col2:
     if pd.isna(val):
         st.write("—")
     else:
-        if indicator_col == "compactness":
-            st.write(f"{float(val):.3f}")
-        else:
-            st.write(f"{float(val):,.1f}")
+        st.write(f"{float(val):.3f}" if indicator_col == "compactness" else f"{float(val):,.1f}")
 
     st.divider()
     st.subheader("Compare A vs B" if lang == "English" else "مقارنة A و B")
 
-    row_b = gdf[gdf["gov_id"].astype(int) == int(b_id)].iloc[0]
-    name_b = row_b["name_en"] if lang == "English" else row_b["name_ar"]
+    if row_b_df.empty:
+        st.warning("Could not find Governorate (B) in the data.")
+    else:
+        row_b = row_b_df.iloc[0]
+        name_b = row_b["name_en"] if lang == "English" else row_b["name_ar"]
 
-    val_a = pd.to_numeric(row_a.get(indicator_col), errors="coerce")
-    val_b = pd.to_numeric(row_b.get(indicator_col), errors="coerce")
+        val_a = pd.to_numeric(row_a.get(indicator_col), errors="coerce")
+        val_b = pd.to_numeric(row_b.get(indicator_col), errors="coerce")
 
-    def fmt(x):
-        if pd.isna(x):
-            return "—"
-        if indicator_col == "compactness":
-            return f"{float(x):.3f}"
-        return f"{float(x):,.1f}"
+        def fmt(x):
+            if pd.isna(x):
+                return "—"
+            return f"{float(x):.3f}" if indicator_col == "compactness" else f"{float(x):,.1f}"
 
-    delta = (val_b - val_a) if (pd.notna(val_a) and pd.notna(val_b)) else None
+        delta = (val_b - val_a) if (pd.notna(val_a) and pd.notna(val_b)) else None
 
-    st.write(f"**A:** {name_a} → {fmt(val_a)}")
-    st.write(f"**B:** {name_b} → {fmt(val_b)}")
-    st.write(f"**Δ (B − A):** {fmt(delta) if delta is not None else '—'}")
-
-
+        st.write(f"**A:** {name_a} → {fmt(val_a)}")
+        st.write(f"**B:** {name_b} → {fmt(val_b)}")
+        st.write(f"**Δ (B − A):** {fmt(delta) if delta is not None else '—'}")
